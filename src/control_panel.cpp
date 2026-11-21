@@ -20,7 +20,7 @@ constexpr int IDC_BTN_CLOSE     = 109;
 
 constexpr UINT_PTR kStatusTimerId = 1;
 
-constexpr int kMarginOptions[] = { 0, 128, 192, 256, 384, 512, 768, 1024 };
+constexpr int kMarginOptions[] = { 0, 192, 256, 320, 384, 512, 768, 1024 };
 
 std::wstring utf8ToWide(const std::string& s) {
     if (s.empty()) return {};

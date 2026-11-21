@@ -395,14 +395,17 @@ ASIOError BridgeDriver::createBuffers(ASIOBufferInfo* bufferInfos, long numChann
         pullScratchPtrs_[static_cast<size_t>(c)] = pullScratch_[static_cast<size_t>(c)].data();
     }
 
-    // Configure adaptive ring buffer
-    const size_t minSafeTarget = static_cast<size_t>(outBufSize_) + 64;
+    // Configure adaptive ring buffer:
+    // Because both interfaces burst asynchronously in inBufSize/outBufSize blocks,
+    // targetFill needs at least (inBufSize + outBufSize + jitter margin) to survive
+    // worst-case phase alignment and Windows USB isochronous jitter with zero underruns.
+    const size_t minSafeTarget = static_cast<size_t>(outBufSize_) + static_cast<size_t>(inBufSize_) / 2 + 64;
     size_t targetFill = 0;
     if (config_.ringBufferFrames > 0) {
         targetFill = std::max<size_t>(static_cast<size_t>(config_.ringBufferFrames), minSafeTarget);
     } else {
         size_t maxBuf = static_cast<size_t>(std::max(inBufSize_, outBufSize_));
-        targetFill = std::max<size_t>((maxBuf * 3) / 2, minSafeTarget);
+        targetFill = static_cast<size_t>(inBufSize_) + static_cast<size_t>(outBufSize_) + std::max<size_t>(64, maxBuf / 2);
     }
 
     ASIOSampleRate sr = currentSampleRate_;

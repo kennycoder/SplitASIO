@@ -108,18 +108,19 @@ public:
         const uint64_t w = writeIndex_.load(std::memory_order_acquire);
 
         // Priming: politely stall with silence until the input device actually wakes up
-        // and fills enough headroom for us to start reading without immediately starving.
+        // and fills enough fresh headroom (relative to readIndex_) so we don't immediately starve.
         if (!primed_) {
-            const uint64_t minPrime = static_cast<uint64_t>(targetFill_) + numFrames + 4;
-            if (w < minPrime) {
-                fillFrames_.store(static_cast<double>(w), std::memory_order_relaxed);
+            const uint64_t availPrime = (w >= readIndex_) ? (w - readIndex_) : 0;
+            const uint64_t minPrime = static_cast<uint64_t>(targetFill_) + 4;
+            if (availPrime < minPrime || w < 2) {
+                fillFrames_.store(static_cast<double>(availPrime), std::memory_order_relaxed);
                 outputSilence();
                 return;
             }
+            // Start reading from the newest targetFill_ frames so we have exact target headroom
             readIndex_ = w - static_cast<uint64_t>(targetFill_);
             frac_ = 0.0;
             smoothedFill_ = targetFill_;
-            integralError_ = 0.0;
             currentRatio_ = 1.0;
             primed_ = true;
             fadeInSamples_ = 32; // Tiny fade-in so your monitors don't punch you in the face with a DC pop
@@ -129,12 +130,15 @@ public:
         // Check for extreme overrun or underrun (e.g. USB hiccup, DAW freeze, or cosmic ray)
         const int64_t signedAvail = static_cast<int64_t>(w) - static_cast<int64_t>(readIndex_);
         const double avail = static_cast<double>(signedAvail) - frac_;
-        const double maxNeeded = static_cast<double>(numFrames) * 1.01 + 4.0;
+        const double maxNeeded = static_cast<double>(numFrames) * 1.005 + 3.0;
         const double maxAllowed = static_cast<double>(capacity_) - static_cast<double>(numFrames) * 2.0 - 64.0;
 
         if (avail < maxNeeded) {
-            // Underrun: input fell behind — throw away our dignity, output silence, and re-prime.
+            // Underrun: input fell behind — advance readIndex_ to w so re-priming waits
+            // for fresh input frames instead of replaying stale audio.
             underruns_.fetch_add(1, std::memory_order_relaxed);
+            readIndex_ = w;
+            frac_ = 0.0;
             primed_ = false;
             primedAtomic_.store(false, std::memory_order_relaxed);
             fillFrames_.store(std::max(0.0, avail), std::memory_order_relaxed);
