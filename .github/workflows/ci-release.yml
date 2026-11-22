@@ -9,11 +9,14 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  build-and-release:
+  build-and-test:
     runs-on: windows-latest
+
+    outputs:
+      version: ${{ steps.version.outputs.version }}
 
     steps:
       - name: Checkout repository
@@ -36,9 +39,9 @@ jobs:
           Write-Host "Resolved version: $ver"
           "version=$ver" >> $env:GITHUB_OUTPUT
 
-      - name: Configure CMake (Visual Studio 2022 x64)
+      - name: Configure CMake (Auto-detect Visual Studio x64)
         shell: pwsh
-        run: cmake -B build -G "Visual Studio 17 2022" -A x64
+        run: cmake -B build -A x64
 
       - name: Build Debug & Release
         shell: pwsh
@@ -55,10 +58,20 @@ jobs:
       - name: Build Inno Setup Installer
         shell: pwsh
         run: |
-          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
-          if (-not (Test-Path $iscc)) {
-            throw "Inno Setup 6 (ISCC.exe) not found on runner."
+          $iscc = @(
+            "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+            "${env:ProgramFiles}\Inno Setup 6\ISCC.exe"
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+          if (-not $iscc) {
+            Write-Host "Inno Setup 6 not preinstalled; installing via Chocolatey..."
+            choco install innosetup -y --no-progress
+            $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
           }
+          if (-not (Test-Path $iscc)) {
+            throw "Inno Setup 6 (ISCC.exe) not found."
+          }
+
           & $iscc "/DMyAppVersion=${{ steps.version.outputs.version }}" "installer\split_asio.iss"
           if ($LASTEXITCODE -ne 0) { throw "ISCC failed." }
 
@@ -75,8 +88,21 @@ jobs:
             dist/SplitASIO-Setup-*.exe
             dist/SHA256SUMS.txt
 
-      - name: Publish GitHub Release (on version tags v*)
-        if: startsWith(github.ref, 'refs/tags/v')
+  release:
+    needs: build-and-test
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download Installer Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: SplitASIO-Setup-${{ needs.build-and-test.outputs.version }}-x64
+          path: dist
+
+      - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
