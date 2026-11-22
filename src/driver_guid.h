@@ -12,3 +12,14 @@ inline constexpr const wchar_t* kAsioBridgeClsidStrW = L"{7A4E9C21-3B8D-4F62-9E1
 inline constexpr const char*    kAsioBridgeNameA     = "SplitASIO";
 inline constexpr const wchar_t* kAsioBridgeNameW     = L"SplitASIO";
 inline constexpr const wchar_t* kAsioBridgeDescW     = L"SplitASIO (Split Input/Output ASIO)";
+
+// {7A4E9C22-3B8D-4F62-9E15-8C04A2B7D632}
+inline constexpr CLSID CLSID_SplitAsioTap = {
+    0x7a4e9c22, 0x3b8d, 0x4f62,
+    { 0x9e, 0x15, 0x8c, 0x04, 0xa2, 0xb7, 0xd6, 0x32 }
+};
+
+inline constexpr const wchar_t* kSplitAsioTapClsidStrW = L"{7A4E9C22-3B8D-4F62-9E15-8C04A2B7D632}";
+inline constexpr const char*    kSplitAsioTapNameA     = "SplitASIO Tap";
+inline constexpr const wchar_t* kSplitAsioTapNameW     = L"SplitASIO Tap";
+inline constexpr const wchar_t* kSplitAsioTapDescW     = L"SplitASIO Tap (Virtual ASIO Input)";

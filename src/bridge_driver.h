@@ -5,6 +5,8 @@
 #include "config.h"
 #include "control_panel.h"
 #include "ring_buffer.h"
+#include "shared_tap.h"
+#include "wasapi_sender.h"
 
 #include <atomic>
 #include <mutex>
@@ -67,6 +69,7 @@ private:
     void onInputBufferSwitch(long doubleBufferIndex);
     ASIOTime* onOutputBufferSwitch(ASIOTime* params, long doubleBufferIndex, ASIOBool directProcess);
     long onChildAsioMessage(bool isInput, long selector, long value, void* message, double* opt);
+    void captureOutputTap(long doubleBufferIndex);
 
     void setError(const std::string& msg);
 
@@ -86,27 +89,44 @@ private:
     double currentSampleRate_ = 48000.0;
     long inBufSize_ = 0;
     long outBufSize_ = 0;
+    long hwOutChannels_ = 0;
+    long virtualOutChannels_ = 0;
+    ASIOSampleType virtualOutSampleType_ = ASIOSTInt32LSB;
+
     std::atomic<bool> streaming_{false};
     std::atomic<bool> outputReadyCalledByHost_{false};
+    std::atomic<bool> tapCapturedThisSwitch_{false};
+    std::atomic<long> currentSwitchBufIndex_{0};
     std::atomic<uint64_t> totalOutputFrames_{0};
 
     ASIOCallbacks hostCallbacks_{};
     bool hostSupportsTimeInfo_ = false;
     bool buffersCreated_ = false;
 
-    // Per-channel metadata & host-visible input double buffers
+    // Per-channel metadata & host-visible double buffers
     std::vector<ASIOSampleType> inSampleTypes_;
+    std::vector<ASIOSampleType> outSampleTypes_;
     std::vector<bool> inChannelActive_;
     std::vector<bool> outChannelActive_;
     std::vector<std::vector<uint8_t>> hostInBuf0_;
     std::vector<std::vector<uint8_t>> hostInBuf1_;
+    std::vector<std::vector<uint8_t>> hostVirtualOutBuf0_;
+    std::vector<std::vector<uint8_t>> hostVirtualOutBuf1_;
 
     // Pre-allocated real-time scratch buffers (zero allocations in callbacks)
     std::vector<std::vector<float>> pushScratch_;
     std::vector<const float*> pushScratchPtrs_;
     std::vector<std::vector<float>> pullScratch_;
     std::vector<float*> pullScratchPtrs_;
+    std::vector<float> tapScratch_[2];
 
     AdaptiveAudioRingBuffer ringBuffer_;
+
+    // Optional broadcast tap outputs (Path B: pure-ASIO shared mem; Path A: WASAPI render)
+    SharedTapPublisher sharedTap_;
+    WasapiSender wasapiSender_;
+    bool asioTapEnabled_ = false;
+    bool wasapiSendEnabled_ = false;
+
     ControlPanel controlPanel_;
 };

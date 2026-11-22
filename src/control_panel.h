@@ -2,6 +2,7 @@
 
 #include "config.h"
 #include "ring_buffer.h"
+#include "wasapi_sender.h"
 
 #include <atomic>
 #include <mutex>
@@ -17,6 +18,10 @@ struct BridgeStatusSnapshot {
     std::string inputDriverName;
     std::string outputDriverName;
     AdaptiveAudioRingBuffer::Telemetry ring;
+
+    TapSource tapSource = TapSource::Disabled;
+    bool asioTapActive = false;
+    WasapiSenderTelemetry wasapi;
 };
 
 struct ControlPanelHost {

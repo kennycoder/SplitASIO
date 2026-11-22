@@ -9,12 +9,12 @@
 
 namespace sample_convert {
 
-inline constexpr float kInt32ScaleInv = 1.0f / 2147483648.0f;
-inline constexpr float kInt32Scale    = 2147483647.0f;
-inline constexpr float kInt24ScaleInv = 1.0f / 8388608.0f;
-inline constexpr float kInt24Scale    = 8388607.0f;
-inline constexpr float kInt16ScaleInv = 1.0f / 32768.0f;
-inline constexpr float kInt16Scale    = 32767.0f;
+inline constexpr double kInt32ScaleInv = 1.0 / 2147483648.0;
+inline constexpr double kInt32Scale    = 2147483647.0;
+inline constexpr float  kInt24ScaleInv = 1.0f / 8388608.0f;
+inline constexpr float  kInt24Scale    = 8388607.0f;
+inline constexpr float  kInt16ScaleInv = 1.0f / 32768.0f;
+inline constexpr float  kInt16Scale    = 32767.0f;
 
 inline size_t sampleByteSize(ASIOSampleType type) {
     switch (type) {
@@ -52,7 +52,7 @@ inline void asioToFloat(const void* src, float* dst, size_t count, ASIOSampleTyp
         case ASIOSTInt32LSB: {
             const auto* s = static_cast<const int32_t*>(src);
             for (size_t i = 0; i < count; ++i) {
-                dst[i] = static_cast<float>(s[i]) * kInt32ScaleInv;
+                dst[i] = static_cast<float>(static_cast<double>(s[i]) * kInt32ScaleInv);
             }
             break;
         }
@@ -119,10 +119,12 @@ inline void floatToAsio(const float* src, void* dst, size_t count, ASIOSampleTyp
 
     switch (type) {
         case ASIOSTInt32LSB: {
+            // Use double precision here: 2147483647.0f rounds up to 2147483648.0f in float32,
+            // which would overflow int32_t and wrap +1.0f to -2147483648 (a full-scale click!).
             auto* d = static_cast<int32_t*>(dst);
             for (size_t i = 0; i < count; ++i) {
-                float v = std::clamp(src[i], -1.0f, 1.0f);
-                d[i] = static_cast<int32_t>(std::lrintf(v * kInt32Scale));
+                double v = std::clamp(static_cast<double>(src[i]), -1.0, 1.0);
+                d[i] = static_cast<int32_t>(std::llround(v * kInt32Scale));
             }
             break;
         }

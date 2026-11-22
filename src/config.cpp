@@ -1,6 +1,7 @@
 #include "config.h"
 #include "asio_registry.h"
 
+#include <algorithm>
 #include <shlobj.h>
 #include <windows.h>
 
@@ -57,6 +58,18 @@ BridgeConfig loadBridgeConfig() {
     }
     cfg.ringBufferFrames = static_cast<int>(GetPrivateProfileIntW(L"Audio", L"RingBufferFrames", 0, path.c_str()));
 
+    int tapSrcInt = static_cast<int>(GetPrivateProfileIntW(L"Broadcast", L"TapSource", 0, path.c_str()));
+    tapSrcInt = std::clamp(tapSrcInt, 0, 2);
+    cfg.tapSource = static_cast<TapSource>(tapSrcInt);
+    cfg.enableAsioTap = (GetPrivateProfileIntW(L"Broadcast", L"EnableAsioTap", 0, path.c_str()) != 0);
+    cfg.enableWasapiSend = (GetPrivateProfileIntW(L"Broadcast", L"EnableWasapiSend", 0, path.c_str()) != 0);
+    if (GetPrivateProfileStringW(L"Broadcast", L"WasapiDeviceId", L"", buf, 512, path.c_str()) > 0) {
+        cfg.wasapiDeviceId = wideToUtf8(buf);
+    }
+    if (GetPrivateProfileStringW(L"Broadcast", L"WasapiDeviceName", L"", buf, 512, path.c_str()) > 0) {
+        cfg.wasapiDeviceName = wideToUtf8(buf);
+    }
+
     // First-run fallback: if no devices are configured yet, pick the first two installed ASIO drivers.
     if (cfg.inputDriver.empty() || cfg.outputDriver.empty()) {
         auto drivers = enumerateAsioDrivers(true);
@@ -87,9 +100,20 @@ bool saveBridgeConfig(const BridgeConfig& cfg) {
     std::wstring inW = utf8ToWide(cfg.inputDriver);
     std::wstring outW = utf8ToWide(cfg.outputDriver);
     std::wstring rbW = std::to_wstring(cfg.ringBufferFrames);
+    std::wstring tapSrcW = std::to_wstring(static_cast<int>(cfg.tapSource));
+    std::wstring asioTapW = cfg.enableAsioTap ? L"1" : L"0";
+    std::wstring wasapiEnW = cfg.enableWasapiSend ? L"1" : L"0";
+    std::wstring wasapiIdW = utf8ToWide(cfg.wasapiDeviceId);
+    std::wstring wasapiNameW = utf8ToWide(cfg.wasapiDeviceName);
 
-    BOOL ok1 = WritePrivateProfileStringW(L"Devices", L"InputDriver", inW.c_str(), path.c_str());
-    BOOL ok2 = WritePrivateProfileStringW(L"Devices", L"OutputDriver", outW.c_str(), path.c_str());
-    BOOL ok3 = WritePrivateProfileStringW(L"Audio", L"RingBufferFrames", rbW.c_str(), path.c_str());
-    return ok1 && ok2 && ok3;
+    BOOL ok = TRUE;
+    ok &= WritePrivateProfileStringW(L"Devices", L"InputDriver", inW.c_str(), path.c_str());
+    ok &= WritePrivateProfileStringW(L"Devices", L"OutputDriver", outW.c_str(), path.c_str());
+    ok &= WritePrivateProfileStringW(L"Audio", L"RingBufferFrames", rbW.c_str(), path.c_str());
+    ok &= WritePrivateProfileStringW(L"Broadcast", L"TapSource", tapSrcW.c_str(), path.c_str());
+    ok &= WritePrivateProfileStringW(L"Broadcast", L"EnableAsioTap", asioTapW.c_str(), path.c_str());
+    ok &= WritePrivateProfileStringW(L"Broadcast", L"EnableWasapiSend", wasapiEnW.c_str(), path.c_str());
+    ok &= WritePrivateProfileStringW(L"Broadcast", L"WasapiDeviceId", wasapiIdW.c_str(), path.c_str());
+    ok &= WritePrivateProfileStringW(L"Broadcast", L"WasapiDeviceName", wasapiNameW.c_str(), path.c_str());
+    return ok != FALSE;
 }

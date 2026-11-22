@@ -135,7 +135,7 @@ void BridgeDriver::getDriverName(char* name) {
 }
 
 long BridgeDriver::getDriverVersion() {
-    return 100; // v1.0.0
+    return 101; // v1.0.1
 }
 
 void BridgeDriver::getErrorMessage(char* string) {
@@ -147,8 +147,9 @@ void BridgeDriver::getErrorMessage(char* string) {
 ASIOError BridgeDriver::getChannels(long* numInputChannels, long* numOutputChannels) {
     std::lock_guard<std::mutex> lock(stateMutex_);
     if (!initialized_) return ASE_NotPresent;
+    const long extraOut = (config_.tapSource == TapSource::VirtualSend) ? 2 : 0;
     if (numInputChannels)  *numInputChannels  = inDriver_.numInputChannels();
-    if (numOutputChannels) *numOutputChannels = outDriver_.numOutputChannels();
+    if (numOutputChannels) *numOutputChannels = outDriver_.numOutputChannels() + extraOut;
     return ASE_OK;
 }
 
@@ -249,6 +250,22 @@ ASIOError BridgeDriver::getChannelInfo(ASIOChannelInfo* info) {
         }
         return err;
     } else {
+        const long hwOut = outDriver_.numOutputChannels();
+        if (config_.tapSource == TapSource::VirtualSend && info->channel >= hwOut && info->channel < hwOut + 2) {
+            const long vIdx = info->channel - hwOut;
+            ASIOSampleType st = !outDriver_.outputChannelInfos().empty()
+                ? outDriver_.outputChannelInfos()[0].type
+                : ASIOSTInt32LSB;
+            bool active = (static_cast<size_t>(info->channel) < outChannelActive_.size() &&
+                           outChannelActive_[static_cast<size_t>(info->channel)]);
+            info->isActive = active ? ASIOTrue : ASIOFalse;
+            info->channelGroup = 0;
+            info->type = st;
+            strncpy_s(info->name, sizeof(info->name),
+                (vIdx == 0) ? "Aux Send L" : "Aux Send R", _TRUNCATE);
+            return ASE_OK;
+        }
+
         ASIOError err = outDriver_.raw()->getChannelInfo(info);
         if (err == ASE_OK) {
             bool active = (info->channel >= 0 &&
@@ -290,6 +307,9 @@ ASIOError BridgeDriver::createBuffers(ASIOBufferInfo* bufferInfos, long numChann
 
     const long outChTotal = outDriver_.numOutputChannels();
     const long inChTotal  = inDriver_.numInputChannels();
+    hwOutChannels_ = outChTotal;
+    virtualOutChannels_ = (config_.tapSource == TapSource::VirtualSend) ? 2 : 0;
+    const long totalExposedOut = hwOutChannels_ + virtualOutChannels_;
 
     outBufSize_ = outDriver_.negotiateBufferSize(bufferSize);
     inBufSize_  = inDriver_.negotiateBufferSize(bufferSize);
@@ -325,7 +345,7 @@ ASIOError BridgeDriver::createBuffers(ASIOBufferInfo* bufferInfos, long numChann
         return err;
     }
 
-    // Record input channel sample formats
+    // Record input & output channel sample formats
     inSampleTypes_.assign(static_cast<size_t>(inChTotal), ASIOSTInt32LSB);
     for (long c = 0; c < inChTotal; ++c) {
         if (static_cast<size_t>(c) < inDriver_.inputChannelInfos().size()) {
@@ -333,8 +353,16 @@ ASIOError BridgeDriver::createBuffers(ASIOBufferInfo* bufferInfos, long numChann
         }
     }
 
+    outSampleTypes_.assign(static_cast<size_t>(outChTotal), ASIOSTInt32LSB);
+    for (long c = 0; c < outChTotal; ++c) {
+        if (static_cast<size_t>(c) < outDriver_.outputChannelInfos().size()) {
+            outSampleTypes_[static_cast<size_t>(c)] = outDriver_.outputChannelInfos()[static_cast<size_t>(c)].type;
+        }
+    }
+    virtualOutSampleType_ = !outSampleTypes_.empty() ? outSampleTypes_[0] : ASIOSTInt32LSB;
+
     inChannelActive_.assign(static_cast<size_t>(inChTotal), false);
-    outChannelActive_.assign(static_cast<size_t>(outChTotal), false);
+    outChannelActive_.assign(static_cast<size_t>(totalExposedOut), false);
 
     // Allocate host-visible input double buffers (zero-initialized)
     hostInBuf0_.resize(static_cast<size_t>(inChTotal));
@@ -345,12 +373,19 @@ ASIOError BridgeDriver::createBuffers(ASIOBufferInfo* bufferInfos, long numChann
         hostInBuf1_[static_cast<size_t>(c)].assign(bytes, 0);
     }
 
+    // Allocate host-visible virtual send double buffers (Out 3/4) when VirtualSend mode is active
+    hostVirtualOutBuf0_.resize(static_cast<size_t>(virtualOutChannels_));
+    hostVirtualOutBuf1_.resize(static_cast<size_t>(virtualOutChannels_));
+    for (long c = 0; c < virtualOutChannels_; ++c) {
+        size_t bytes = static_cast<size_t>(outBufSize_) * sample_convert::sampleByteSize(virtualOutSampleType_);
+        hostVirtualOutBuf0_[static_cast<size_t>(c)].assign(bytes, 0);
+        hostVirtualOutBuf1_[static_cast<size_t>(c)].assign(bytes, 0);
+    }
+
     // Zero all child output buffers initially
     const auto& outChildBufs = outDriver_.bufferInfos();
     for (size_t c = 0; c < outChildBufs.size(); ++c) {
-        ASIOSampleType st = (c < outDriver_.outputChannelInfos().size())
-            ? outDriver_.outputChannelInfos()[c].type
-            : ASIOSTInt32LSB;
+        ASIOSampleType st = (c < outSampleTypes_.size()) ? outSampleTypes_[c] : ASIOSTInt32LSB;
         size_t bytes = static_cast<size_t>(outBufSize_) * sample_convert::sampleByteSize(st);
         if (outChildBufs[c].buffers[0]) std::memset(outChildBufs[c].buffers[0], 0, bytes);
         if (outChildBufs[c].buffers[1]) std::memset(outChildBufs[c].buffers[1], 0, bytes);
@@ -369,16 +404,23 @@ ASIOError BridgeDriver::createBuffers(ASIOBufferInfo* bufferInfos, long numChann
             bufferInfos[i].buffers[0] = hostInBuf0_[static_cast<size_t>(ch)].data();
             bufferInfos[i].buffers[1] = hostInBuf1_[static_cast<size_t>(ch)].data();
         } else {
-            if (ch < 0 || ch >= outChTotal) {
+            if (ch < 0 || ch >= totalExposedOut) {
                 inDriver_.disposeBuffers();
                 outDriver_.disposeBuffers();
                 return ASE_InvalidParameter;
             }
             outChannelActive_[static_cast<size_t>(ch)] = true;
-            // Zero-copy direct output passthrough: hand the output hardware's DMA buffers straight
-            // to the DAW like hot potatoes — 0 extra copies and 0 extra output latency.
-            bufferInfos[i].buffers[0] = outChildBufs[static_cast<size_t>(ch)].buffers[0];
-            bufferInfos[i].buffers[1] = outChildBufs[static_cast<size_t>(ch)].buffers[1];
+            if (ch < hwOutChannels_) {
+                // Zero-copy direct output passthrough: hand the output hardware's DMA buffers straight
+                // to the DAW like hot potatoes — 0 extra copies and 0 extra output latency.
+                bufferInfos[i].buffers[0] = outChildBufs[static_cast<size_t>(ch)].buffers[0];
+                bufferInfos[i].buffers[1] = outChildBufs[static_cast<size_t>(ch)].buffers[1];
+            } else {
+                // Dedicated virtual Broadcast Send bus (Out 3/4)
+                const size_t vIdx = static_cast<size_t>(ch - hwOutChannels_);
+                bufferInfos[i].buffers[0] = hostVirtualOutBuf0_[vIdx].data();
+                bufferInfos[i].buffers[1] = hostVirtualOutBuf1_[vIdx].data();
+            }
         }
     }
 
@@ -394,6 +436,9 @@ ASIOError BridgeDriver::createBuffers(ASIOBufferInfo* bufferInfos, long numChann
     for (long c = 0; c < inChTotal; ++c) {
         pullScratchPtrs_[static_cast<size_t>(c)] = pullScratch_[static_cast<size_t>(c)].data();
     }
+
+    tapScratch_[0].assign(static_cast<size_t>(outBufSize_), 0.0f);
+    tapScratch_[1].assign(static_cast<size_t>(outBufSize_), 0.0f);
 
     // Configure adaptive ring buffer:
     // Because both interfaces burst asynchronously in inBufSize/outBufSize blocks,
@@ -425,17 +470,27 @@ ASIOError BridgeDriver::disposeBuffers() {
     streaming_.store(false, std::memory_order_release);
     outDriver_.stop();
     inDriver_.stop();
+    wasapiSender_.stop();
+    sharedTap_.close();
+    asioTapEnabled_ = false;
+    wasapiSendEnabled_ = false;
+
     outDriver_.disposeBuffers();
     inDriver_.disposeBuffers();
 
     hostInBuf0_.clear();
     hostInBuf1_.clear();
+    hostVirtualOutBuf0_.clear();
+    hostVirtualOutBuf1_.clear();
     pushScratch_.clear();
     pushScratchPtrs_.clear();
     pullScratch_.clear();
     pullScratchPtrs_.clear();
+    tapScratch_[0].clear();
+    tapScratch_[1].clear();
     inChannelActive_.clear();
     outChannelActive_.clear();
+    outSampleTypes_.clear();
     buffersCreated_ = false;
     return ASE_OK;
 }
@@ -446,12 +501,33 @@ ASIOError BridgeDriver::start() {
 
     ringBuffer_.reset();
     totalOutputFrames_.store(0, std::memory_order_relaxed);
+
+    // Start optional broadcast tap outputs (strictly side-branch; never blocks ASIO)
+    asioTapEnabled_ = false;
+    wasapiSendEnabled_ = false;
+    if (config_.tapSource != TapSource::Disabled) {
+        if (config_.enableAsioTap) {
+            asioTapEnabled_ = sharedTap_.open(currentSampleRate_, static_cast<uint32_t>(outBufSize_));
+        }
+        if (config_.enableWasapiSend && !config_.wasapiDeviceId.empty()) {
+            wasapiSendEnabled_ = wasapiSender_.start(
+                config_.wasapiDeviceId,
+                config_.wasapiDeviceName,
+                currentSampleRate_,
+                static_cast<size_t>(outBufSize_));
+        }
+    }
+
     streaming_.store(true, std::memory_order_release);
 
     // Start input device first so ring buffer begins filling immediately
     ASIOError eIn = inDriver_.start();
     if (eIn != ASE_OK) {
         streaming_.store(false, std::memory_order_release);
+        wasapiSender_.stop();
+        sharedTap_.close();
+        asioTapEnabled_ = false;
+        wasapiSendEnabled_ = false;
         setError("Failed to start input ASIO driver.");
         return eIn;
     }
@@ -460,6 +536,10 @@ ASIOError BridgeDriver::start() {
     if (eOut != ASE_OK) {
         streaming_.store(false, std::memory_order_release);
         inDriver_.stop();
+        wasapiSender_.stop();
+        sharedTap_.close();
+        asioTapEnabled_ = false;
+        wasapiSendEnabled_ = false;
         setError("Failed to start output ASIO driver.");
         return eOut;
     }
@@ -472,6 +552,10 @@ ASIOError BridgeDriver::stop() {
     streaming_.store(false, std::memory_order_release);
     if (outDriver_.isOpen()) outDriver_.stop();
     if (inDriver_.isOpen())  inDriver_.stop();
+    wasapiSender_.stop();
+    sharedTap_.close();
+    asioTapEnabled_ = false;
+    wasapiSendEnabled_ = false;
     return ASE_OK;
 }
 
@@ -486,6 +570,11 @@ ASIOError BridgeDriver::future(long /*selector*/, void* /*opt*/) {
 
 ASIOError BridgeDriver::outputReady() {
     outputReadyCalledByHost_.store(true, std::memory_order_relaxed);
+    // Capture broadcast tap BEFORE handing DMA buffers off to the output hardware
+    if (streaming_.load(std::memory_order_acquire) &&
+        !tapCapturedThisSwitch_.exchange(true, std::memory_order_acq_rel)) {
+        captureOutputTap(currentSwitchBufIndex_.load(std::memory_order_relaxed));
+    }
     if (outDriver_.isOpen()) {
         return outDriver_.raw()->outputReady();
     }
@@ -538,12 +627,14 @@ void BridgeDriver::openOutputDriverPanel() {
 
 void BridgeDriver::resetXruns() {
     ringBuffer_.resetXruns();
+    wasapiSender_.resetXruns();
 }
 
 BridgeStatusSnapshot BridgeDriver::getStatus() const {
     BridgeStatusSnapshot snap{};
     snap.streaming = streaming_.load(std::memory_order_relaxed);
     snap.ring = ringBuffer_.getTelemetry();
+    snap.wasapi = wasapiSender_.getTelemetry();
     {
         std::lock_guard<std::mutex> lock(stateMutex_);
         snap.sampleRate = currentSampleRate_;
@@ -551,6 +642,8 @@ BridgeStatusSnapshot BridgeDriver::getStatus() const {
         snap.outputBufferSize = outBufSize_ > 0 ? outBufSize_ : outDriver_.preferredBufferSize();
         snap.inputDriverName = inDriver_.driverName();
         snap.outputDriverName = outDriver_.driverName();
+        snap.tapSource = config_.tapSource;
+        snap.asioTapActive = asioTapEnabled_;
     }
     return snap;
 }
@@ -648,6 +741,8 @@ ASIOTime* BridgeDriver::onOutputBufferSwitch(ASIOTime* params, long doubleBuffer
         }
     }
 
+    currentSwitchBufIndex_.store(doubleBufferIndex, std::memory_order_relaxed);
+    tapCapturedThisSwitch_.store(false, std::memory_order_relaxed);
     outputReadyCalledByHost_.store(false, std::memory_order_relaxed);
 
     // Drive DAW callback on master (FiiO) clock
@@ -669,6 +764,11 @@ ASIOTime* BridgeDriver::onOutputBufferSwitch(ASIOTime* params, long doubleBuffer
 
     totalOutputFrames_.fetch_add(frames, std::memory_order_relaxed);
 
+    // If the DAW didn't call outputReady(), capture the broadcast tap now before flushing to hardware
+    if (!tapCapturedThisSwitch_.exchange(true, std::memory_order_acq_rel)) {
+        captureOutputTap(doubleBufferIndex);
+    }
+
     // Some DAWs politely call outputReady() to tell the hardware "I'm done writing...";
     // others (yes I'm looking at you ChiFi..) just ghost us and return. Cover for the rude ones so the output DAC stays happy.
     if (!outputReadyCalledByHost_.load(std::memory_order_relaxed) && outDriver_.isOpen()) {
@@ -676,6 +776,53 @@ ASIOTime* BridgeDriver::onOutputBufferSwitch(ASIOTime* params, long doubleBuffer
     }
 
     return result;
+}
+
+void BridgeDriver::captureOutputTap(long doubleBufferIndex) {
+    if (config_.tapSource == TapSource::Disabled) return;
+    if (!asioTapEnabled_ && !wasapiSendEnabled_) return;
+    if (doubleBufferIndex != 0 && doubleBufferIndex != 1) return;
+
+    const size_t frames = static_cast<size_t>(outBufSize_);
+    if (tapScratch_[0].size() < frames || tapScratch_[1].size() < frames) return;
+
+    if (config_.tapSource == TapSource::MirrorMaster) {
+        const auto& outChildBufs = outDriver_.bufferInfos();
+        for (size_t c = 0; c < 2; ++c) {
+            if (c < outChildBufs.size() && c < outSampleTypes_.size() &&
+                c < outChannelActive_.size() && outChannelActive_[c] &&
+                outChildBufs[c].buffers[doubleBufferIndex]) {
+                sample_convert::asioToFloat(
+                    outChildBufs[c].buffers[doubleBufferIndex],
+                    tapScratch_[c].data(),
+                    frames,
+                    outSampleTypes_[c]);
+            } else {
+                std::memset(tapScratch_[c].data(), 0, frames * sizeof(float));
+            }
+        }
+    } else if (config_.tapSource == TapSource::VirtualSend) {
+        const auto& vBufs = (doubleBufferIndex == 0) ? hostVirtualOutBuf0_ : hostVirtualOutBuf1_;
+        for (size_t c = 0; c < 2; ++c) {
+            const size_t chIdx = static_cast<size_t>(hwOutChannels_) + c;
+            if (c < vBufs.size() && chIdx < outChannelActive_.size() && outChannelActive_[chIdx]) {
+                sample_convert::asioToFloat(
+                    vBufs[c].data(),
+                    tapScratch_[c].data(),
+                    frames,
+                    virtualOutSampleType_);
+            } else {
+                std::memset(tapScratch_[c].data(), 0, frames * sizeof(float));
+            }
+        }
+    }
+
+    if (asioTapEnabled_) {
+        sharedTap_.push(tapScratch_[0].data(), tapScratch_[1].data(), frames);
+    }
+    if (wasapiSendEnabled_) {
+        wasapiSender_.push(tapScratch_[0].data(), tapScratch_[1].data(), frames);
+    }
 }
 
 long BridgeDriver::onChildAsioMessage(bool /*isInput*/, long selector, long value, void* message, double* opt) {

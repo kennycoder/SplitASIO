@@ -89,7 +89,7 @@ std::vector<AsioDriverEntry> enumerateAsioDrivers(bool excludeSelf) {
             continue;
         }
 
-        if (excludeSelf && IsEqualCLSID(clsid, CLSID_AsioBridge)) {
+        if (excludeSelf && (IsEqualCLSID(clsid, CLSID_AsioBridge) || IsEqualCLSID(clsid, CLSID_SplitAsioTap))) {
             continue;
         }
 

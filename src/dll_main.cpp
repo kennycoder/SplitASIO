@@ -1,5 +1,6 @@
 #include "bridge_driver.h"
 #include "driver_guid.h"
+#include "tap_driver.h"
 
 #include <atomic>
 #include <new>
@@ -12,10 +13,11 @@ namespace {
 HMODULE g_module = nullptr;
 std::atomic<long> g_dllRefCount{0};
 
-class BridgeClassFactory final : public IClassFactory {
+template <typename DriverT>
+class AsioClassFactory final : public IClassFactory {
 public:
-    BridgeClassFactory() { g_dllRefCount.fetch_add(1, std::memory_order_relaxed); }
-    ~BridgeClassFactory() { g_dllRefCount.fetch_sub(1, std::memory_order_relaxed); }
+    AsioClassFactory() { g_dllRefCount.fetch_add(1, std::memory_order_relaxed); }
+    ~AsioClassFactory() { g_dllRefCount.fetch_sub(1, std::memory_order_relaxed); }
 
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override {
         if (!ppvObject) return E_POINTER;
@@ -43,7 +45,7 @@ public:
         *ppvObject = nullptr;
         if (pUnkOuter) return CLASS_E_NOAGGREGATION;
 
-        auto* drv = new (std::nothrow) BridgeDriver();
+        auto* drv = new (std::nothrow) DriverT();
         if (!drv) return E_OUTOFMEMORY;
 
         HRESULT hr = drv->QueryInterface(riid, ppvObject);
@@ -76,6 +78,37 @@ LONG setRegSz(HKEY root, const wchar_t* subkey, const wchar_t* valueName, const 
     return st;
 }
 
+HRESULT registerAsioDriver(const wchar_t* clsidStr, const wchar_t* name, const wchar_t* desc, const wchar_t* dllPath) {
+    std::wstring clsidKey = std::wstring(L"CLSID\\") + clsidStr;
+    std::wstring inprocKey = clsidKey + L"\\InprocServer32";
+    std::wstring asioKey = std::wstring(L"SOFTWARE\\ASIO\\") + name;
+
+    LONG st = setRegSz(HKEY_CLASSES_ROOT, clsidKey.c_str(), nullptr, name);
+    if (st != ERROR_SUCCESS) return HRESULT_FROM_WIN32(st);
+
+    st = setRegSz(HKEY_CLASSES_ROOT, inprocKey.c_str(), nullptr, dllPath);
+    if (st != ERROR_SUCCESS) return HRESULT_FROM_WIN32(st);
+
+    st = setRegSz(HKEY_CLASSES_ROOT, inprocKey.c_str(), L"ThreadingModel", L"Apartment");
+    if (st != ERROR_SUCCESS) return HRESULT_FROM_WIN32(st);
+
+    st = setRegSz(HKEY_LOCAL_MACHINE, asioKey.c_str(), L"CLSID", clsidStr);
+    if (st != ERROR_SUCCESS) return HRESULT_FROM_WIN32(st);
+
+    st = setRegSz(HKEY_LOCAL_MACHINE, asioKey.c_str(), L"Description", desc);
+    if (st != ERROR_SUCCESS) return HRESULT_FROM_WIN32(st);
+
+    return S_OK;
+}
+
+void unregisterAsioDriver(const wchar_t* clsidStr, const wchar_t* name) {
+    std::wstring clsidKey = std::wstring(L"CLSID\\") + clsidStr;
+    std::wstring asioKey = std::wstring(L"SOFTWARE\\ASIO\\") + name;
+
+    RegDeleteTreeW(HKEY_CLASSES_ROOT, clsidKey.c_str());
+    RegDeleteTreeW(HKEY_LOCAL_MACHINE, asioKey.c_str());
+}
+
 } // namespace
 
 void dllObjectCreated() {
@@ -97,14 +130,24 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ulReason, LPVOID /*lpReserved*/) {
 STDAPI DllGetClassObject(REFCLSID rclsid, REFIID riid, LPVOID* ppv) {
     if (!ppv) return E_POINTER;
     *ppv = nullptr;
-    if (!IsEqualCLSID(rclsid, CLSID_AsioBridge)) {
-        return CLASS_E_CLASSNOTAVAILABLE;
+
+    if (IsEqualCLSID(rclsid, CLSID_AsioBridge)) {
+        auto* factory = new (std::nothrow) AsioClassFactory<BridgeDriver>();
+        if (!factory) return E_OUTOFMEMORY;
+        HRESULT hr = factory->QueryInterface(riid, ppv);
+        factory->Release();
+        return hr;
     }
-    auto* factory = new (std::nothrow) BridgeClassFactory();
-    if (!factory) return E_OUTOFMEMORY;
-    HRESULT hr = factory->QueryInterface(riid, ppv);
-    factory->Release();
-    return hr;
+
+    if (IsEqualCLSID(rclsid, CLSID_SplitAsioTap)) {
+        auto* factory = new (std::nothrow) AsioClassFactory<TapDriver>();
+        if (!factory) return E_OUTOFMEMORY;
+        HRESULT hr = factory->QueryInterface(riid, ppv);
+        factory->Release();
+        return hr;
+    }
+
+    return CLASS_E_CLASSNOTAVAILABLE;
 }
 
 STDAPI DllCanUnloadNow() {
@@ -117,33 +160,15 @@ STDAPI DllRegisterServer() {
         return HRESULT_FROM_WIN32(GetLastError());
     }
 
-    std::wstring clsidKey = std::wstring(L"CLSID\\") + kAsioBridgeClsidStrW;
-    std::wstring inprocKey = clsidKey + L"\\InprocServer32";
-    std::wstring asioKey = std::wstring(L"SOFTWARE\\ASIO\\") + kAsioBridgeNameW;
+    HRESULT hr = registerAsioDriver(kAsioBridgeClsidStrW, kAsioBridgeNameW, kAsioBridgeDescW, dllPath);
+    if (FAILED(hr)) return hr;
 
-    LONG st = setRegSz(HKEY_CLASSES_ROOT, clsidKey.c_str(), nullptr, kAsioBridgeNameW);
-    if (st != ERROR_SUCCESS) return HRESULT_FROM_WIN32(st);
-
-    st = setRegSz(HKEY_CLASSES_ROOT, inprocKey.c_str(), nullptr, dllPath);
-    if (st != ERROR_SUCCESS) return HRESULT_FROM_WIN32(st);
-
-    st = setRegSz(HKEY_CLASSES_ROOT, inprocKey.c_str(), L"ThreadingModel", L"Apartment");
-    if (st != ERROR_SUCCESS) return HRESULT_FROM_WIN32(st);
-
-    st = setRegSz(HKEY_LOCAL_MACHINE, asioKey.c_str(), L"CLSID", kAsioBridgeClsidStrW);
-    if (st != ERROR_SUCCESS) return HRESULT_FROM_WIN32(st);
-
-    st = setRegSz(HKEY_LOCAL_MACHINE, asioKey.c_str(), L"Description", kAsioBridgeDescW);
-    if (st != ERROR_SUCCESS) return HRESULT_FROM_WIN32(st);
-
-    return S_OK;
+    hr = registerAsioDriver(kSplitAsioTapClsidStrW, kSplitAsioTapNameW, kSplitAsioTapDescW, dllPath);
+    return hr;
 }
 
 STDAPI DllUnregisterServer() {
-    std::wstring clsidKey = std::wstring(L"CLSID\\") + kAsioBridgeClsidStrW;
-    std::wstring asioKey = std::wstring(L"SOFTWARE\\ASIO\\") + kAsioBridgeNameW;
-
-    RegDeleteTreeW(HKEY_CLASSES_ROOT, clsidKey.c_str());
-    RegDeleteTreeW(HKEY_LOCAL_MACHINE, asioKey.c_str());
+    unregisterAsioDriver(kAsioBridgeClsidStrW, kAsioBridgeNameW);
+    unregisterAsioDriver(kSplitAsioTapClsidStrW, kSplitAsioTapNameW);
     return S_OK;
 }

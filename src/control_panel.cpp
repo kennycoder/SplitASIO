@@ -1,5 +1,6 @@
 #include "control_panel.h"
 #include "asio_registry.h"
+#include "wasapi_sender.h"
 
 #include <commctrl.h>
 #include <cstdio>
@@ -8,15 +9,19 @@
 
 namespace {
 
-constexpr int IDC_COMBO_INPUT   = 101;
-constexpr int IDC_BTN_IN_PANEL  = 102;
-constexpr int IDC_COMBO_OUTPUT  = 103;
-constexpr int IDC_BTN_OUT_PANEL = 104;
-constexpr int IDC_COMBO_MARGIN  = 105;
-constexpr int IDC_STATUS_TEXT   = 106;
-constexpr int IDC_BTN_RESET_XR  = 107;
-constexpr int IDC_BTN_APPLY     = 108;
-constexpr int IDC_BTN_CLOSE     = 109;
+constexpr int IDC_COMBO_INPUT     = 101;
+constexpr int IDC_BTN_IN_PANEL    = 102;
+constexpr int IDC_COMBO_OUTPUT    = 103;
+constexpr int IDC_BTN_OUT_PANEL   = 104;
+constexpr int IDC_COMBO_MARGIN    = 105;
+constexpr int IDC_COMBO_TAP_SRC   = 110;
+constexpr int IDC_CHK_ASIO_TAP    = 111;
+constexpr int IDC_CHK_WASAPI_SEND = 112;
+constexpr int IDC_COMBO_WASAPI    = 113;
+constexpr int IDC_STATUS_TEXT     = 106;
+constexpr int IDC_BTN_RESET_XR    = 107;
+constexpr int IDC_BTN_APPLY       = 108;
+constexpr int IDC_BTN_CLOSE       = 109;
 
 constexpr UINT_PTR kStatusTimerId = 1;
 
@@ -31,15 +36,6 @@ std::wstring utf8ToWide(const std::string& s) {
     return out;
 }
 
-std::string wideToUtf8(const std::wstring& w) {
-    if (w.empty()) return {};
-    int len = WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), nullptr, 0, nullptr, nullptr);
-    if (len <= 0) return {};
-    std::string out(static_cast<size_t>(len), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), out.data(), len, nullptr, nullptr);
-    return out;
-}
-
 struct PanelState {
     ControlPanelHost* host = nullptr;
     HFONT font = nullptr;
@@ -47,17 +43,51 @@ struct PanelState {
     HWND comboInput = nullptr;
     HWND comboOutput = nullptr;
     HWND comboMargin = nullptr;
+    HWND comboTapSrc = nullptr;
+    HWND chkAsioTap = nullptr;
+    HWND chkWasapiSend = nullptr;
+    HWND comboWasapi = nullptr;
     HWND statusEdit = nullptr;
     std::vector<AsioDriverEntry> drivers;
+    std::vector<WasapiEndpointInfo> wasapiEndpoints;
 };
+
+void syncBroadcastControlStates(PanelState* st) {
+    if (!st) return;
+    LRESULT tapIdx = SendMessageW(st->comboTapSrc, CB_GETCURSEL, 0, 0);
+    const bool tapEnabled = (tapIdx > 0);
+    EnableWindow(st->chkAsioTap, tapEnabled ? TRUE : FALSE);
+    EnableWindow(st->chkWasapiSend, tapEnabled ? TRUE : FALSE);
+    const bool wasapiChecked = (SendMessageW(st->chkWasapiSend, BM_GETCHECK, 0, 0) == BST_CHECKED);
+    EnableWindow(st->comboWasapi, (tapEnabled && wasapiChecked) ? TRUE : FALSE);
+}
 
 void updateStatusDisplay(PanelState* st) {
     if (!st || !st->host || !st->statusEdit) return;
     BridgeStatusSnapshot s = st->host->getStatus();
 
-    wchar_t buf[1024]{};
+    wchar_t buf[1536]{};
     const wchar_t* stateStr = s.streaming ? (s.ring.primed ? L"Streaming (Locked)" : L"Streaming (Priming...)") : L"Idle";
     double latencyMs = (s.sampleRate > 0.0) ? (s.ring.fillFrames * 1000.0 / s.sampleRate) : 0.0;
+
+    const wchar_t* asioTapStr = L"Off";
+    if (s.tapSource != TapSource::Disabled && s.asioTapActive) {
+        asioTapStr = (s.tapSource == TapSource::VirtualSend) ? L"Active (Out 3/4)" : L"Active (Out 1/2)";
+    }
+
+    wchar_t wasapiStr[256]{};
+    if (!s.wasapi.enabled) {
+        wcscpy_s(wasapiStr, L"Off");
+    } else if (s.wasapi.active) {
+        std::swprintf(wasapiStr, std::size(wasapiStr), L"Active (%+.1f ppm, %llu xr)",
+            s.wasapi.ring.driftPpm,
+            static_cast<unsigned long long>(s.wasapi.ring.underruns + s.wasapi.ring.overruns));
+    } else if (!s.wasapi.error.empty()) {
+        std::wstring errW = utf8ToWide(s.wasapi.error);
+        std::swprintf(wasapiStr, std::size(wasapiStr), L"Error: %s", errW.c_str());
+    } else {
+        wcscpy_s(wasapiStr, L"Starting...");
+    }
 
     std::swprintf(buf, std::size(buf),
         L"State:        %s\r\n"
@@ -65,7 +95,9 @@ void updateStatusDisplay(PanelState* st) {
         L"Buffers:      In %ld / Out %ld frames\r\n"
         L"Ring Fill:    %.1f / %.0f frames (%.2f ms)\r\n"
         L"Clock Drift:  %+.1f ppm\r\n"
-        L"Xruns:        %llu underruns, %llu overruns",
+        L"Xruns:        %llu underruns, %llu overruns\r\n"
+        L"ASIO Tap:     %s\r\n"
+        L"WASAPI Out:   %s",
         stateStr,
         s.sampleRate,
         s.inputBufferSize,
@@ -75,7 +107,9 @@ void updateStatusDisplay(PanelState* st) {
         latencyMs,
         s.ring.driftPpm,
         static_cast<unsigned long long>(s.ring.underruns),
-        static_cast<unsigned long long>(s.ring.overruns)
+        static_cast<unsigned long long>(s.ring.overruns),
+        asioTapStr,
+        wasapiStr
     );
     SetWindowTextW(st->statusEdit, buf);
 }
@@ -126,7 +160,7 @@ LRESULT CALLBACK panelWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP,
                 pad + 300, y - 1, 115, 25, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_BTN_IN_PANEL)), nullptr, nullptr);
             setFont(btnInPanel, st->font);
-            y += 36;
+            y += 34;
 
             // Output ASIO Device
             HWND lblOut = CreateWindowExW(0, L"STATIC", L"Output ASIO Device (Master Clock / Playback):",
@@ -143,7 +177,7 @@ LRESULT CALLBACK panelWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP,
                 pad + 300, y - 1, 115, 25, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_BTN_OUT_PANEL)), nullptr, nullptr);
             setFont(btnOutPanel, st->font);
-            y += 36;
+            y += 34;
 
             // Ring Buffer Margin
             HWND lblMargin = CreateWindowExW(0, L"STATIC", L"Bridge Input Buffer Margin:",
@@ -154,9 +188,39 @@ LRESULT CALLBACK panelWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP,
                 pad + 190, y, 225, 200, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_COMBO_MARGIN)), nullptr, nullptr);
             setFont(st->comboMargin, st->font);
-            y += 36;
+            y += 34;
 
-            // Status Group Box
+            // Secondary Output Routing Section
+            HWND lblTap = CreateWindowExW(0, L"STATIC", L"Secondary Output Routing:",
+                WS_CHILD | WS_VISIBLE, pad, y, 320, 20, hwnd, nullptr, nullptr, nullptr);
+            setFont(lblTap, st->font);
+            y += 22;
+
+            st->comboTapSrc = CreateWindowExW(0, L"COMBOBOX", nullptr,
+                WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP,
+                pad, y, 415, 200, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_COMBO_TAP_SRC)), nullptr, nullptr);
+            setFont(st->comboTapSrc, st->font);
+            y += 30;
+
+            st->chkAsioTap = CreateWindowExW(0, L"BUTTON", L"Enable \"SplitASIO Tap\" (Virtual ASIO Input)",
+                WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX | WS_TABSTOP,
+                pad, y, 415, 22, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_CHK_ASIO_TAP)), nullptr, nullptr);
+            setFont(st->chkAsioTap, st->font);
+            y += 24;
+
+            st->chkWasapiSend = CreateWindowExW(0, L"BUTTON", L"Mirror to Windows Audio Device (WASAPI):",
+                WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX | WS_TABSTOP,
+                pad, y, 415, 22, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_CHK_WASAPI_SEND)), nullptr, nullptr);
+            setFont(st->chkWasapiSend, st->font);
+            y += 24;
+
+            st->comboWasapi = CreateWindowExW(0, L"COMBOBOX", nullptr,
+                WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP,
+                pad, y, 415, 220, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_COMBO_WASAPI)), nullptr, nullptr);
+            setFont(st->comboWasapi, st->font);
+            y += 34;
+
+            // Live Status
             HWND lblStatus = CreateWindowExW(0, L"STATIC", L"Live Bridge Telemetry:",
                 WS_CHILD | WS_VISIBLE, pad, y, 200, 20, hwnd, nullptr, nullptr, nullptr);
             setFont(lblStatus, st->font);
@@ -164,9 +228,9 @@ LRESULT CALLBACK panelWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
             st->statusEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
                 WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_READONLY,
-                pad, y, 415, 116, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_STATUS_TEXT)), nullptr, nullptr);
+                pad, y, 415, 138, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_STATUS_TEXT)), nullptr, nullptr);
             setFont(st->statusEdit, st->monoFont);
-            y += 126;
+            y += 148;
 
             // Action Buttons
             HWND btnReset = CreateWindowExW(0, L"BUTTON", L"Reset Xruns",
@@ -184,7 +248,7 @@ LRESULT CALLBACK panelWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 pad + 330, y, 85, 28, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_BTN_CLOSE)), nullptr, nullptr);
             setFont(btnClose, st->font);
 
-            // Populate drivers
+            // Populate ASIO drivers
             st->drivers = enumerateAsioDrivers(true);
             BridgeConfig cfg = st->host ? st->host->getConfig() : loadBridgeConfig();
 
@@ -218,6 +282,41 @@ LRESULT CALLBACK panelWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             }
             SendMessageW(st->comboMargin, CB_SETCURSEL, marginSel, 0);
 
+            // Populate Secondary Output Routing options
+            SendMessageW(st->comboTapSrc, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Disabled"));
+            SendMessageW(st->comboTapSrc, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Mirror Main Output (Out 1/2)"));
+            SendMessageW(st->comboTapSrc, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Separate Aux Bus (Out 3/4)"));
+            SendMessageW(st->comboTapSrc, CB_SETCURSEL, static_cast<WPARAM>(cfg.tapSource), 0);
+
+            SendMessageW(st->chkAsioTap, BM_SETCHECK, cfg.enableAsioTap ? BST_CHECKED : BST_UNCHECKED, 0);
+            SendMessageW(st->chkWasapiSend, BM_SETCHECK, cfg.enableWasapiSend ? BST_CHECKED : BST_UNCHECKED, 0);
+
+            // Populate WASAPI Render endpoints
+            st->wasapiEndpoints = enumerateWasapiRenderEndpoints();
+            int wasapiSel = -1;
+            for (size_t i = 0; i < st->wasapiEndpoints.size(); ++i) {
+                std::wstring nameW = utf8ToWide(st->wasapiEndpoints[i].name);
+                SendMessageW(st->comboWasapi, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(nameW.c_str()));
+                if (!cfg.wasapiDeviceId.empty() && st->wasapiEndpoints[i].id == cfg.wasapiDeviceId) {
+                    wasapiSel = static_cast<int>(i);
+                }
+            }
+            if (wasapiSel < 0 && !st->wasapiEndpoints.empty()) {
+                // Prefer VB-Cable / Virtual Cable if present so user sees it right away
+                wasapiSel = 0;
+                for (size_t i = 0; i < st->wasapiEndpoints.size(); ++i) {
+                    if (st->wasapiEndpoints[i].name.find("CABLE Input") != std::string::npos ||
+                        st->wasapiEndpoints[i].name.find("Virtual") != std::string::npos) {
+                        wasapiSel = static_cast<int>(i);
+                        break;
+                    }
+                }
+            }
+            if (wasapiSel >= 0) {
+                SendMessageW(st->comboWasapi, CB_SETCURSEL, wasapiSel, 0);
+            }
+
+            syncBroadcastControlStates(st);
             updateStatusDisplay(st);
             SetTimer(hwnd, kStatusTimerId, 250, nullptr);
             return 0;
@@ -232,7 +331,14 @@ LRESULT CALLBACK panelWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
         case WM_COMMAND: {
             int id = LOWORD(wParam);
+            int code = HIWORD(wParam);
             if (!st || !st->host) break;
+
+            if ((id == IDC_COMBO_TAP_SRC && code == CBN_SELCHANGE) ||
+                id == IDC_CHK_WASAPI_SEND) {
+                syncBroadcastControlStates(st);
+                return 0;
+            }
 
             if (id == IDC_BTN_IN_PANEL) {
                 st->host->openInputDriverPanel();
@@ -249,6 +355,19 @@ LRESULT CALLBACK panelWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 if (mIdx >= 0 && static_cast<size_t>(mIdx) < std::size(kMarginOptions)) {
                     cfg.ringBufferFrames = kMarginOptions[mIdx];
                 }
+
+                LRESULT tapIdx = SendMessageW(st->comboTapSrc, CB_GETCURSEL, 0, 0);
+                if (tapIdx >= 0 && tapIdx <= 2) {
+                    cfg.tapSource = static_cast<TapSource>(tapIdx);
+                }
+                cfg.enableAsioTap = (SendMessageW(st->chkAsioTap, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                cfg.enableWasapiSend = (SendMessageW(st->chkWasapiSend, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                LRESULT wIdx = SendMessageW(st->comboWasapi, CB_GETCURSEL, 0, 0);
+                if (wIdx >= 0 && static_cast<size_t>(wIdx) < st->wasapiEndpoints.size()) {
+                    cfg.wasapiDeviceId = st->wasapiEndpoints[static_cast<size_t>(wIdx)].id;
+                    cfg.wasapiDeviceName = st->wasapiEndpoints[static_cast<size_t>(wIdx)].name;
+                }
+
                 if (cfg.inputDriver == cfg.outputDriver && !cfg.inputDriver.empty()) {
                     MessageBoxW(hwnd, L"Input and Output ASIO devices should be different devices.",
                         L"SplitASIO", MB_OK | MB_ICONWARNING);
@@ -344,7 +463,7 @@ void ControlPanel::uiThreadMain(ControlPanelHost* host) {
     PanelState state{};
     state.host = host;
 
-    RECT rc{ 0, 0, 444, 382 };
+    RECT rc{ 0, 0, 444, 514 };
     DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
     AdjustWindowRect(&rc, style, FALSE);
 

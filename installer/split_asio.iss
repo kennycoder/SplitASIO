@@ -1,7 +1,9 @@
 ; Inno Setup 6 Script for SplitASIO (Windows x64)
 
 #define MyAppName "SplitASIO"
-#define MyAppVersion "1.0.0"
+#ifndef MyAppVersion
+  #define MyAppVersion "1.0.1"
+#endif
 #define MyAppPublisher "SplitASIO"
 #define MyAppExeName "split_asio_config.exe"
 
@@ -19,6 +21,7 @@ ArchitecturesInstallIn64BitMode=x64compatible
 PrivilegesRequired=admin
 OutputDir=..\dist
 OutputBaseFilename=SplitASIO-Setup-{#MyAppVersion}-x64
+SetupIconFile=..\assets\split_asio.ico
 Compression=lzma2/ultra64
 SolidCompression=yes
 WizardStyle=modern

@@ -18,7 +18,7 @@ A lightweight, pure **ASIO-to-ASIO** split input/output driver for 64-bit Window
 
 ## Installation
 
-1. Download and run **`SplitASIO-Setup-1.0.0-x64.exe`** from here (github releases that is).
+1. Download and run **`SplitASIO-Setup-1.0.1-x64.exe`** from here (github releases that is).
 2. The installer copies the driver to `C:\Program Files\SplitASIO`, automatically registers the 64-bit ASIO COM driver, and adds **SplitASIO Settings** to your Start Menu.
 3. At the end of setup, keep **Configure SplitASIO input/output devices now** checked to pick your **Input ASIO Device** and **Output ASIO Device** (you can also use **Device Panel...** to set matching low buffer sizes, e.g., `64` or `128` samples, on both interfaces).
 4. Open your 64-bit DAW or standalone amp sim (Reaper, Neural DSP, Ableton Live, Cubase, Studio One, etc.) and choose:
@@ -26,6 +26,20 @@ A lightweight, pure **ASIO-to-ASIO** split input/output driver for 64-bit Window
    - **ASIO Driver / Device**: `SplitASIO`
 
 To uninstall at any time, use **Windows Settings → Apps → Installed apps → SplitASIO** (or the Start Menu shortcut). This automatically unregisters the ASIO driver cleanly.
+
+### Secondary Output Routing (OBS, Discord, or Another App)
+
+Open **SplitASIO Settings** (Start Menu) or your DAW's **ASIO Control Panel**:
+
+1. Choose a **Secondary Output Routing** source:
+   - **Mirror Main Output (Out 1/2)** — *Recommended for standalone amp sims (AmpliTube, Neural DSP, etc.) and quick setups.* Automatically copies whatever your app sends to your main output DAC (`Out 1/2`).
+   - **Separate Aux Bus (Out 3/4)** — *For full DAWs (Reaper, Ableton Live, Cubase, etc.).* Exposes two extra ASIO output channels (**`Aux Send L`** / **`Aux Send R`**) to your DAW. `Out 3/4` stays **silent by default** until you explicitly add a hardware output/send in your DAW to `Aux Send L / R` — ideal when you want to send only your guitar/mic to a stream or call without including your metronome or backing tracks. *(Standalone amp sims only output stereo `Out 1/2`, so use **Mirror Main Output** with them.)*
+2. Enable **either or both** destinations simultaneously (both receive the source you selected above without affecting your primary ASIO monitoring latency):
+   - **Virtual ASIO Input (`SplitASIO Tap`)** — Pure ASIO-to-ASIO with no virtual cables needed. Check **Enable "SplitASIO Tap" (Virtual ASIO Input)**. In OBS Studio (with the `obs-asio` plugin) or another ASIO app, select **`SplitASIO Tap`** (`SplitASIO Tap L` / `SplitASIO Tap R`).
+   - **Windows Audio Device Mirror (WASAPI)** — Mirrors audio to any Windows playback endpoint. Check **Mirror to Windows Audio Device (WASAPI)** and pick a target device:
+     - To route into **Discord, Zoom, or native OBS**: install a free virtual audio cable such as **VB-Cable** (`winget install VB-Audio.Cable`), select **`CABLE Input (VB-Audio Virtual Cable)`** in SplitASIO, and choose **`CABLE Output`** as your microphone / input device in Discord or OBS.
+     - *Discord guitar tip*: Disable **Echo Cancellation**, **Noise Suppression (Krisp)**, and **Automatic Gain Control** in Discord's Voice & Video settings so sustained guitar notes aren't filtered out.
+3. Click **Save & Apply**, then **restart your DAW / amp sim** (or re-select `SplitASIO`) so the new routing takes effect. Verify in the Control Panel telemetry box that `ASIO Tap:` and/or `WASAPI Out:` show **`Active`**.
 
 ### Configuration File
 
@@ -37,8 +51,16 @@ InputDriver=Focusrite USB ASIO
 OutputDriver=FiiO ASIO Driver
 
 [Audio]
-; 0 = Auto (1.5x max buffer size, lowest safe latency)
+; 0 = Auto (lowest safe latency)
 RingBufferFrames=0
+
+[Broadcast]
+; 0 = Off, 1 = Mirror Main Output (Out 1/2), 2 = Separate Aux Bus (Out 3/4)
+TapSource=0
+EnableAsioTap=0
+EnableWasapiSend=0
+WasapiDeviceId=
+WasapiDeviceName=
 ```
 
 ---
@@ -75,7 +97,7 @@ Requires **Inno Setup 6** (`winget install JRSoftware.InnoSetup`):
 .\scripts\build_release.ps1
 ```
 
-This compiles the Release x64 binaries and packages `dist\SplitASIO-Setup-1.0.0-x64.exe` along with its SHA-256 checksum.
+This compiles the Release x64 binaries and packages `dist\SplitASIO-Setup-1.0.1-x64.exe` along with its SHA-256 checksum.
 
 ---
 
@@ -93,7 +115,10 @@ This compiles the Release x64 binaries and packages `dist\SplitASIO-Setup-1.0.0-
     ├── asio_abi.h              # Clean-room binary-compatible Steinberg IASIO x64 ABI
     ├── asio_registry.h/.cpp    # HKLM\SOFTWARE\ASIO driver enumeration
     ├── asio_host.h/.cpp        # Child IASIO COM driver wrapper
-    ├── bridge_driver.h/.cpp    # Main IASIO COM implementation
+    ├── bridge_driver.h/.cpp    # Main IASIO COM implementation ("SplitASIO")
+    ├── tap_driver.h/.cpp       # Companion virtual ASIO input driver ("SplitASIO Tap")
+    ├── shared_tap.h/.cpp       # Cross-process named shared-memory stereo ring buffer
+    ├── wasapi_sender.h/.cpp    # Optional background WASAPI render mirror + endpoint enum
     ├── ring_buffer.h           # Lock-free SPSC ring buffer + PI Catmull-Rom resampler
     ├── sample_convert.h        # Real-time ASIO <-> float32 sample converters
     ├── config.h/.cpp           # %APPDATA%\SplitASIO\config.ini persistence
